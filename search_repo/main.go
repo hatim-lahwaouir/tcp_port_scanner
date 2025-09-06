@@ -6,17 +6,21 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
+	"time"
 )
 
 type Commit struct {
-	Msg    string
-	Author string
-	Hash   string
-	Branche string
-	FilesPath []string
+	Msg      string
+	Author   string
+	Hash     string
+	Branche  string
+	FilePath string
 }
 
 type Branche struct {
@@ -25,19 +29,18 @@ type Branche struct {
 
 // commits that we need to search for
 
-// files that we should ignore 
+// files that we should ignore
 var ignored_files []string = []string{".git"}
 
 func IgnoreFile(path string) bool {
 
-	for _, fn := range(ignored_files){
+	for _, fn := range ignored_files {
 		if strings.Contains(path, fn) {
 			return true
 		}
 	}
 	return false
 }
-
 
 func GetBranchesName() []string {
 
@@ -67,17 +70,13 @@ func GetBranchesName() []string {
 		brs = append(brs, string(line))
 	}
 
-	fmt.Println("----branches currenty searching ----")
-	for _, br := range brs {
-		fmt.Printf("-- %s\n", br)
-	}
 	return brs
 }
 
 func GetCommits(br string, commits map[string]Commit) {
 	var (
-		cmd  *exec.Cmd
-		out  bytes.Buffer
+		cmd *exec.Cmd
+		out bytes.Buffer
 	)
 	// switch to the branche
 	cmd = exec.Command("git", "switch", br)
@@ -102,23 +101,20 @@ func GetCommits(br string, commits map[string]Commit) {
 		}
 		line = line[:len(line)-1]
 		arr := strings.SplitN(string(line), "|", 3)
-		commits[arr[0]] = Commit{Hash: arr[0], Author: arr[1], Msg: arr[2], Branche : br}
+		commits[arr[0]] = Commit{Hash: arr[0], Author: arr[1], Msg: arr[2], Branche: br}
 	}
 }
 
-
-
-func Reset(){
+func Reset() {
 	cmd := exec.Command("git", "switch", "main")
 	if err := cmd.Run(); err != nil {
-		log.Fatal(err)
+		log.Fatal(err, "we need to have access to main branch")
 	}
 }
 
-
-func ListAllFiles(cmt Commit) {
+func ListAllFiles(cmt Commit) []string {
 	var (
-		cmd *exec.Cmd
+		cmd       *exec.Cmd
 		filesPath []string
 	)
 
@@ -127,11 +123,9 @@ func ListAllFiles(cmt Commit) {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("-- files in this commit %s --\n", cmt.Hash)
 	err := filepath.Walk(".", func(path string, info fs.FileInfo, err error) error {
 
-		if !info.IsDir() && IgnoreFile(path) == false{
-			fmt.Printf("file to search for : %q\n", path)
+		if !info.IsDir() && IgnoreFile(path) == false {
 			filesPath = append(filesPath, path)
 		}
 
@@ -140,26 +134,86 @@ func ListAllFiles(cmt Commit) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	cmt.FilesPath = filesPath
-	Reset()
+	return filesPath
 }
 
+func Search(chanel chan Commit, pattern string, mt *sync.Mutex, ft *int) {
+	var (
+		re  *regexp.Regexp
+		arr [][]byte
+	)
+	re = regexp.MustCompile(pattern)
 
-func Search(filePath string, pattern string) {
+	for f := range chanel {
+		c, err := os.ReadFile(f.FilePath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		arr = re.FindAll(c, -1)
 
+		if len(arr) != 0 {
+			fmt.Printf("At file %s\n", f.FilePath)
+		}
+		mt.Lock()
+		*ft += 1
+		mt.Unlock()
+	}
 
 }
 
 func main() {
-	commits := make(map[string]Commit)
+
+	if len(os.Args) != 2 {
+		log.Fatal("Invalid args")
+	}
+	var (
+		filesPath    []string
+		commits      map[string]Commit
+		chanel       chan Commit
+		wg           sync.WaitGroup
+		mt           sync.Mutex
+		file_treated int
+	)
+
+	Reset()
+	chanel = make(chan Commit, 50)
+	commits = make(map[string]Commit)
+
 	brs := GetBranchesName()
 	for _, br := range brs {
 		GetCommits(br, commits)
 	}
 
-	for _, cmt := range commits {
-		ListAllFiles(cmt)
+	// creating workers
+	for i := 0; i < 20; i += 1 {
+		wg.Add(1)
+		go func() {
+			Search(chanel, os.Args[1], &mt, &file_treated)
+			wg.Done()
+		}()
 	}
 
+	for _, cmt := range commits {
+		filesPath = ListAllFiles(cmt)
+		file_treated = 0
+
+		fmt.Printf("-- searching this commit %s --\n", cmt.Hash)
+		for _, f := range filesPath {
+			c_cmt := cmt
+			c_cmt.FilePath = f
+			chanel <- c_cmt
+		}
+		for {
+			mt.Lock()
+			if file_treated == len(filesPath) {
+				mt.Unlock()
+				break
+			}
+			mt.Unlock()
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+	close(chanel)
+	wg.Wait()
 	Reset()
 }
